@@ -1,0 +1,10 @@
+# CPU PyTorch wheels (keeps the build small enough for Streamlit Community Cloud)
+--extra-index-url https://download.pytorch.org/whl/cpu
+streamlit
+torch
+torchvision
+pillow
+numpy
+matplotlib
+h5py
+scipy
