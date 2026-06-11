@@ -15,6 +15,12 @@ Checkpoints are read from results/checkpoints/ and are named
     {model}_{segment|subject}_train80_seed{seed}.pth
 (produced by the _FULL training notebook). The 80–20 ratio is fixed, so only the
 model and seed are user-selectable.
+
+The _FULL notebook also writes results/incorrect_subject/ — the test slices that
+were misclassified under the patient-level (subject) split, named so that the true
+class is recoverable. Selecting that folder here shows, for each such slice, how the
+leaky vs leakage-free models behave (the leaky model often "gets it right" by
+recognizing the patient).
 """
 
 import io
@@ -149,11 +155,19 @@ def load_mat_image(data: bytes):
     return pil, RAW_LABEL_TO_NAME.get(raw_label)
 
 
+def ground_truth_from_name(name: str):
+    """Recover the true class from an incorrect_subject filename (…__true-<class>__…)."""
+    m = re.search(r"true-(meningioma|glioma|pituitary)", name.lower())
+    return m.group(1) if m else None
+
+
 def load_any(name: str, data: bytes):
     """Dispatch on extension. Returns (PIL RGB, ground_truth|None)."""
     if name.lower().endswith(".mat"):
         return load_mat_image(data)
-    return Image.open(io.BytesIO(data)).convert("RGB"), None
+    # Normal image; recover ground truth from the filename when it encodes it
+    # (e.g. files saved to results/incorrect_subject/ by the _FULL notebook).
+    return Image.open(io.BytesIO(data)).convert("RGB"), ground_truth_from_name(name)
 
 
 # ----------------------------------------------------------------------------
@@ -218,7 +232,7 @@ def run_inference(ckpt_path: Path, image: Image.Image, alpha: float):
 
 
 def render_split_column(col, split_key: str, ckpt_path: Path, image: Image.Image,
-                        alpha: float, true_label):
+                        alpha: float, true_label, abstain_thr: float = 0.0):
     meta = SPLITS[split_key]
     with col:
         st.markdown(
@@ -236,11 +250,18 @@ def render_split_column(col, split_key: str, ckpt_path: Path, image: Image.Image
             st.error(f"Error: {e}")
             return None
 
+        r["deferred"] = (abstain_thr > 0) and (r["conf"] < abstain_thr)
         correct = (true_label is not None) and (r["pred_class"] == true_label)
         cap = f"Pred: {r['pred_class'].upper()}"
         if true_label is not None:
             cap += "  ✓" if correct else "  ✗"
         st.image(r["overlay"], caption=cap, use_container_width=True)
+        if r["deferred"]:
+            st.markdown(
+                f"<div style='background:#4a3a00;border-radius:6px;padding:6px 10px;margin:4px 0'>"
+                f"⏸ <b>Abstains</b> — confidence {r['conf']*100:.1f}% &lt; threshold "
+                f"{abstain_thr*100:.0f}%; would defer to a human expert.</div>",
+                unsafe_allow_html=True)
         st.markdown(f"**Confidence: {r['conf']*100:.2f}%**")
         st.markdown("All probabilities:")
         order = np.argsort(-r["probs"])
@@ -289,6 +310,10 @@ model_choice = st.sidebar.selectbox(
 seed_choices = sorted(combos[model_choice])
 seed_choice = st.sidebar.selectbox("Seed", seed_choices, index=0)
 alpha = st.sidebar.slider("Grad-CAM overlay opacity", 0.0, 1.0, 0.5, 0.05)
+abstain_thr = st.sidebar.slider(
+    "Abstention threshold — defer if confidence below", 0.0, 1.0, 0.0, 0.05,
+    help="Selective prediction: when a model's top-class confidence is below this value it "
+         "abstains and would defer the case to a human expert. Set to 0 to disable abstention.")
 
 seg_ckpt = CKPT_DIR / f"{model_choice}_segment_train80_seed{seed_choice}.pth"
 subj_ckpt = CKPT_DIR / f"{model_choice}_subject_train80_seed{seed_choice}.pth"
@@ -303,7 +328,9 @@ with st.expander("What am I comparing?  (paper context)"):
         "- **Subject split (patient-level):** train/test split over patients, so every slice of a patient "
         "stays on one side. This reflects real, patient-independent performance.\n\n"
         "In the paper, removing leakage lowers accuracy by ~5–7 points and degrades calibration 3–5×, "
-        "with meningioma and pituitary tumors affected most."
+        "with meningioma and pituitary tumors affected most.\n\n"
+        "**Tip:** choose the *Incorrect — subject split* sample folder to browse the exact test slices the "
+        "patient-level model got wrong; the leaky model often predicts them correctly by recognizing the patient."
     )
 
 # ---- Input source ----
@@ -312,7 +339,7 @@ process_queue = []  # (name, PIL image, true_label|None)
 
 if input_source == "Upload Image":
     uploaded = st.file_uploader(
-        "Upload MRI images (.jpg, .png, .tif, or figshare .mat slices)",
+        "Upload MRI images (.jpg, .png, .tif, figshare .mat, or files from results/incorrect_subject/)",
         type=["jpg", "jpeg", "png", "tif", "tiff", "mat"],
         accept_multiple_files=True,
     )
@@ -323,10 +350,22 @@ if input_source == "Upload Image":
         except Exception as e:
             st.error(f"Could not read {uf.name}: {e}")
 else:
-    sample_dir = Path(st.text_input("Sample image folder", value="sample_images"))
+    # Known result folders produced by the _FULL notebook, plus a custom-path option.
+    KNOWN_FOLDERS = {
+        "Incorrect — subject split  (results/incorrect_subject)": Path("results/incorrect_subject"),
+        "Physician review sample  (results/physician_review_sample)": Path("results/physician_review_sample"),
+        "Custom folder…": None,
+    }
+    folder_choice = st.selectbox("Sample folder", list(KNOWN_FOLDERS.keys()))
+    if KNOWN_FOLDERS[folder_choice] is None:
+        sample_dir = Path(st.text_input("Folder path", value="sample_images"))
+    else:
+        sample_dir = KNOWN_FOLDERS[folder_choice]
+
     if not sample_dir.exists():
-        st.info(f"Folder `{sample_dir}` not found. Create it and drop in `.mat`/`.png`/`.jpg` slices, "
-                "or switch to Upload Image.")
+        st.info(f"Folder `{sample_dir}` not found. The *incorrect_subject* gallery is written by the "
+                "`_FULL` notebook (`results/incorrect_subject/`); place the unzipped `results/` next to "
+                "this app, or switch to Upload Image.")
     else:
         valid = {".jpg", ".jpeg", ".png", ".tif", ".tiff", ".mat"}
         files = sorted(str(f.relative_to(sample_dir)) for f in sample_dir.rglob("*")
@@ -351,14 +390,14 @@ else:
         st.divider()
         st.subheader(f"📄 {filename}")
         if true_label is not None:
-            st.markdown(f"Ground truth (from .mat): **{true_label}**")
+            st.markdown(f"Ground truth: **{true_label}**")
 
         c_orig, c_seg, c_subj = st.columns([1, 1, 1])
         with c_orig:
             st.markdown("**Original**")
             st.image(image, use_container_width=True)
-        r_seg = render_split_column(c_seg, "segment", seg_ckpt, image, alpha, true_label)
-        r_subj = render_split_column(c_subj, "subject", subj_ckpt, image, alpha, true_label)
+        r_seg = render_split_column(c_seg, "segment", seg_ckpt, image, alpha, true_label, abstain_thr)
+        r_subj = render_split_column(c_subj, "subject", subj_ckpt, image, alpha, true_label, abstain_thr)
 
         # ---- Comparison note ----
         if r_seg and r_subj:
@@ -369,12 +408,29 @@ else:
                     f"Segment confidence is {dconf:+.1f} points vs. the patient-level model."
                 )
             else:
-                st.warning(
+                msg = (
                     f"⚠️ Predictions differ — segment (leaky) → **{r_seg['pred_class'].upper()}** "
                     f"({r_seg['conf']*100:.1f}%), subject (patient-level) → "
                     f"**{r_subj['pred_class'].upper()}** ({r_subj['conf']*100:.1f}%). "
                     "Disagreements like this are exactly what slice-level leakage hides."
                 )
+                if true_label is not None:
+                    seg_ok = r_seg["pred_class"] == true_label
+                    subj_ok = r_subj["pred_class"] == true_label
+                    if seg_ok and not subj_ok:
+                        msg += (f"  Here the leaky model is *correct* and the patient-level model is *wrong* — "
+                                f"the inflated case the paper warns about.")
+                st.warning(msg)
+
+        # ---- Abstention summary (when enabled) ----
+        if r_seg and r_subj and abstain_thr > 0:
+            def _state(r):
+                return "abstains (defers)" if r.get("deferred") else f"predicts {r['pred_class'].upper()}"
+            st.info(
+                f"At abstention threshold τ = {abstain_thr*100:.0f}%:  "
+                f"🔶 segment {_state(r_seg)};  🟢 subject {_state(r_subj)}.  "
+                "A well-behaved model should defer the cases it is likely to get wrong."
+            )
 
 st.divider()
 st.caption(
